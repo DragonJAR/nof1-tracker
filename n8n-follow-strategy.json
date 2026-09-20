@@ -1,0 +1,467 @@
+{
+  "name": "NOF1 Follow Strategy",
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {
+        "triggerTimes": {
+          "item": [
+            {
+              "minutes": {
+                "every": 1
+              }
+            }
+          ]
+        }
+      },
+      "id": "Cron1",
+      "name": "Cron Trigger",
+      "type": "n8n-nodes-base.cron",
+      "typeVersion": 2,
+      "position": [
+        200,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "keepOnlySet": true,
+        "values": {
+          "string": [
+            {
+              "name": "agentId",
+              "value": "deepseek-chat-v3.1"
+            },
+            {
+              "name": "nof1BaseUrl",
+              "value": "https://nof1.ai/api"
+            },
+            {
+              "name": "binanceApiKey",
+              "value": ""
+            },
+            {
+              "name": "binanceApiSecret",
+              "value": ""
+            },
+            {
+              "name": "telegramToken",
+              "value": ""
+            },
+            {
+              "name": "telegramChatId",
+              "value": ""
+            }
+          ],
+          "number": [
+            {
+              "name": "priceTolerance",
+              "value": 1
+            },
+            {
+              "name": "totalMargin",
+              "value": 10
+            },
+            {
+              "name": "profitTarget",
+              "value": 0
+            }
+          ],
+          "boolean": [
+            {
+              "name": "autoRefollow",
+              "value": false
+            },
+            {
+              "name": "testnet",
+              "value": true
+            },
+            {
+              "name": "telegramEnabled",
+              "value": false
+            }
+          ],
+          "other": [
+            {
+              "name": "marginType",
+              "value": "CROSSED"
+            }
+          ]
+        }
+      },
+      "id": "Set1",
+      "name": "Set Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 2,
+      "position": [
+        410,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "const item = items[0];\nconst INITIAL = new Date('2025-10-17T22:30:00.000Z').getTime();\nconst marker = Math.floor((Date.now() - INITIAL) / (1000*60*60));\nconst base = item.json.nof1BaseUrl || 'https://nof1.ai/api';\nitem.json.accountTotalsUrl = `${base}/account-totals?lastHourlyMarker=${marker}`;\nitem.json.binanceBaseUrl = item.json.testnet ? 'https://testnet.binancefuture.com' : 'https://fapi.binance.com';\nreturn items;"
+      },
+      "id": "Func1",
+      "name": "Compute URLs",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        620,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{$json.accountTotalsUrl}}",
+        "options": {},
+        "responseFormat": "json"
+      },
+      "id": "Http1",
+      "name": "Fetch Account Totals",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        620,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "mergeByIndex"
+      },
+      "id": "Merge1",
+      "name": "Merge Config+Data",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 2,
+      "position": [
+        840,
+        310
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "const data = items[0].json;\nconst state = this.getWorkflowStaticData('global');\nstate.lastPositions = state.lastPositions || {};\nstate.lastOids = state.lastOids || {};\nconst agentId = data.agentId;\nconst entries = (data.accountTotals || []).filter(a => a.model_id === agentId);\nif (entries.length === 0) {\n  return [];\n}\n// Selecciona el último por since_inception_hourly_marker\nentries.sort((a,b) => (b.since_inception_hourly_marker || 0) - (a.since_inception_hourly_marker || 0));\nconst latest = entries[0];\nconst currentPositions = latest.positions || {};\nconst previousPositions = state.lastPositions[agentId] || {};\n// Actualiza estado con posiciones actuales\nstate.lastPositions[agentId] = currentPositions;\n\n// Tabla de OIDs ejecutados para evitar duplicados\nconst agentOids = state.lastOids[agentId] || (state.lastOids[agentId] = {});\n\nfunction withinTolerance(entry, current, tolerance) {\n  if (!entry || !current || entry <= 0) return true;\n  const diff = Math.abs((current - entry) / entry) * 100;\n  return diff <= tolerance;\n}\n\nconst priceTolerance = Number(data.priceTolerance) || 1;\n\nconst symbols = Array.from(new Set([\n  ...Object.keys(previousPositions),\n  ...Object.keys(currentPositions)\n]));\nconst plans = [];\nfor (const sym of symbols) {\n  const prev = previousPositions[sym];\n  const curr = currentPositions[sym];\n  const prevQty = prev ? Math.abs(prev.quantity || 0) : 0;\n  const currQty = curr ? Math.abs(curr.quantity || 0) : 0;\n\n  // ENTER: nueva posición (deduplicación por OID)\n  if (!prev && curr && currQty > 0) {\n    const oid = curr.entry_oid;\n    // Si ya ejecutamos esta OID para este símbolo, saltar\n    if (oid && agentOids[sym] === oid) {\n      continue;\n    }\n    plans.push({\n      action: 'ENTER',\n      symbol: sym,\n      side: (curr.quantity || 0) > 0 ? 'BUY' : 'SELL',\n      type: 'MARKET',\n      quantity: currQty,\n      leverage: curr.leverage || 1,\n      entryPrice: curr.entry_price,\n      currentPrice: curr.current_price,\n      shouldExecute: withinTolerance(curr.entry_price, curr.current_price, priceTolerance),\n      reason: `New position opened by ${agentId} (OID: ${curr.entry_oid})`,\n      entry_oid: curr.entry_oid\n    });\n  } else if (prev && (!curr || currQty === 0) && prevQty > 0) {\n    // EXIT: posición cerrada\n    plans.push({\n      action: 'EXIT',\n      symbol: sym,\n      side: (prev.quantity || 0) > 0 ? 'SELL' : 'BUY',\n      type: 'MARKET',\n      quantity: prevQty,\n      leverage: prev.leverage || 1,\n      exitPrice: curr ? curr.current_price : prev.entry_price,\n      shouldExecute: true,\n      reason: `Position closed by ${agentId}`\n    });\n  }\n}\n\nconst batchSize = Math.max(plans.length, 1);\n\nreturn plans.map(p => ({ json: {\n  ...p,\n  agentId,\n  priceTolerance,\n  batchSize,\n  totalMargin: data.totalMargin,\n  marginType: data.marginType,\n  binanceBaseUrl: data.binanceBaseUrl,\n  binanceApiKey: data.binanceApiKey,\n  binanceApiSecret: data.binanceApiSecret,\n  telegramEnabled: data.telegramEnabled,\n  telegramToken: data.telegramToken,\n  telegramChatId: data.telegramChatId\n} }));"
+      },
+      "id": "Func2",
+      "name": "Build Follow Plans",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        1060,
+        310
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{$json.shouldExecute}}",
+              "operation": "is true"
+            }
+          ]
+        }
+      },
+      "id": "If1",
+      "name": "IF Execute",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1280,
+        310
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "function formatQty(base, qty) {\n  switch(base) {\n    case 'BTC': return Number(qty).toFixed(3);\n    case 'ETH': return Number(qty).toFixed(3);\n    case 'BNB': return Number(qty).toFixed(2);\n    case 'SOL': return Number(qty).toFixed(2);\n    case 'XRP': return Number(qty).toFixed(0);\n    case 'DOGE': return Number(qty).toFixed(0);\n    default: return Number(qty).toFixed(4);\n  }\n}\nconst item = items[0].json;\nconst ts = Date.now();\nconst recvWindow = 5000;\nconst symbolPair = item.symbol;\nconst base = symbolPair.replace('USDT', '');\nconst side = item.side;\nconst type = 'MARKET';\nconst newOrderRespType = 'RESULT';\n\n// Gestión de capital: si hay totalMargin y currentPrice válidos, ajustar cantidad\nconst totalMargin = Number(item.totalMargin || 0);\nconst leverage = Number(item.leverage || 1);\nconst currentPrice = Number(item.currentPrice || 0);\nconst batchSize = Number(item.batchSize || 1);\nlet quantityCalc = Number(item.quantity || 0);\nif (totalMargin > 0 && currentPrice > 0 && batchSize > 0) {\n  const allocated = totalMargin / batchSize;\n  const desiredQty = (allocated * leverage) / currentPrice;\n  quantityCalc = desiredQty;\n}\nconst quantity = formatQty(base, quantityCalc);\n\nconst queryString = `symbol=${symbolPair}&side=${side}&type=${type}&quantity=${quantity}&newOrderRespType=${newOrderRespType}&timestamp=${ts}&recvWindow=${recvWindow}`;\nreturn [{ json: {\n  ...item,\n  order: { symbol: symbolPair, side, type, quantity },\n  queryString\n} }];"
+      },
+      "id": "Func3",
+      "name": "Prepare Binance Order",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        1500,
+        260
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "hmac",
+        "hmacAlgorithm": "sha256",
+        "hmacEncoding": "hex",
+        "hmacSecret": "={{$json.binanceApiSecret}}",
+        "hmacMessage": "={{$json.queryString}}",
+        "assignToProperty": "signature"
+      },
+      "id": "Crypto1",
+      "name": "Compute Signature",
+      "type": "n8n-nodes-base.crypto",
+      "typeVersion": 2,
+      "position": [
+        1710,
+        260
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{$json.binanceBaseUrl}}/fapi/v1/order?{{$json.queryString}}&signature={{$json.signature}}",
+        "options": {
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "X-MBX-APIKEY",
+                "value": "={{$json.binanceApiKey}}"
+              }
+            ]
+          }
+        },
+        "responseFormat": "json",
+        "sendBody": false,
+        "method": "POST"
+      },
+      "id": "Http2",
+      "name": "Place Futures Order",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        1920,
+        260
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "mergeByIndex"
+      },
+      "id": "Merge2",
+      "name": "Merge Order+Context",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 2,
+      "position": [
+        2130,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "const item = items[0].json;\nconst state = this.getWorkflowStaticData('global');\nstate.lastOids = state.lastOids || {};\nconst agentId = item.agentId || 'deepseek-chat-v3.1';\nstate.lastOids[agentId] = state.lastOids[agentId] || {};\n// Marca OID ejecutada sólo para ENTER\nif (item.action === 'ENTER' && item.entry_oid) {\n  state.lastOids[agentId][item.symbol] = item.entry_oid;\n}\nreturn items;"
+      },
+      "id": "Func4",
+      "name": "Update OID State",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        2330,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{$json.telegramEnabled}}",
+              "operation": "is true"
+            }
+          ]
+        }
+      },
+      "id": "If2",
+      "name": "IF Telegram Enabled",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2130,
+        260
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{`https://api.telegram.org/bot${$json.telegramToken}/sendMessage`}}",
+        "options": {
+          "bodyContentType": "json"
+        },
+        "responseFormat": "json",
+        "sendBody": true,
+        "jsonParameters": true,
+        "queryParameters": [],
+        "bodyParametersJson": "={\n  \"chat_id\": \"${$json.telegramChatId}\",\n  \"text\": \"✅ Trade Executed\\n\\n${$json.side} ${$json.order.symbol}\\nQuantity: ${$json.order.quantity}\\nReason: ${$json.reason}\"\n}"
+      },
+      "id": "Http3",
+      "name": "Send Telegram Message",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        2330,
+        200
+      ]
+    }
+  ],
+  "connections": {
+    "Cron Trigger": {
+      "main": [
+        [
+          {
+            "node": "Set Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set Config": {
+      "main": [
+        [
+          {
+            "node": "Compute URLs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compute URLs": {
+      "main": [
+        [
+          {
+            "node": "Fetch Account Totals",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Merge Config+Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Account Totals": {
+      "main": [
+        [
+          {
+            "node": "Merge Config+Data",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Merge Config+Data": {
+      "main": [
+        [
+          {
+            "node": "Build Follow Plans",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Follow Plans": {
+      "main": [
+        [
+          {
+            "node": "IF Execute",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF Execute": {
+      "main": [
+        [
+          {
+            "node": "Prepare Binance Order",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Binance Order": {
+      "main": [
+        [
+          {
+            "node": "Compute Signature",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compute Signature": {
+      "main": [
+        [
+          {
+            "node": "Place Futures Order",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Place Futures Order": {
+      "main": [
+        [
+          {
+            "node": "Merge Order+Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compute Signature": {
+      "main": [
+        [
+          {
+            "node": "Merge Order+Context",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Merge Order+Context": {
+      "main": [
+        [
+          {
+            "node": "Update OID State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update OID State": {
+      "main": [
+        [
+          {
+            "node": "IF Telegram Enabled",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF Telegram Enabled": {
+      "main": [
+        [
+          {
+            "node": "Send Telegram Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": {}
+}

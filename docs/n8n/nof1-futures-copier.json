@@ -1,0 +1,476 @@
+{
+  "name": "NOF1 Futures Copier",
+  "nodes": [
+    {
+      "parameters": {
+        "triggerTimes": {
+          "item": [
+            {
+              "mode": "everyX",
+              "value": 1,
+              "unit": "minutes"
+            }
+          ]
+        }
+      },
+      "id": "CronTrigger",
+      "name": "Agent Poll Schedule",
+      "type": "n8n-nodes-base.cron",
+      "typeVersion": 1,
+      "position": [
+        200,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "keepOnlySet": true,
+        "values": {
+          "string": [
+            {
+              "name": "agentId",
+              "value": "={{ $env.NOF1_AGENT_ID }}"
+            },
+            {
+              "name": "baseUrl",
+              "value": "={{ $env.NOF1_API_BASE_URL || 'https://nof1.ai/api' }}"
+            },
+            {
+              "name": "marginType",
+              "value": "={{ $env.NOF1_MARGIN_TYPE || 'CROSSED' }}"
+            },
+            {
+              "name": "telegramToken",
+              "value": "={{ $env.TELEGRAM_API_TOKEN }}"
+            },
+            {
+              "name": "telegramChatId",
+              "value": "={{ $env.TELEGRAM_CHAT_ID }}"
+            }
+          ],
+          "number": [
+            {
+              "name": "priceTolerance",
+              "value": "={{ $env.NOF1_PRICE_TOLERANCE ? Number($env.NOF1_PRICE_TOLERANCE) : 1 }}"
+            },
+            {
+              "name": "totalMargin",
+              "value": "={{ $env.NOF1_TOTAL_MARGIN ? Number($env.NOF1_TOTAL_MARGIN) : null }}"
+            },
+            {
+              "name": "fixedAmountPerCoin",
+              "value": "={{ $env.NOF1_FIXED_AMOUNT ? Number($env.NOF1_FIXED_AMOUNT) : null }}"
+            },
+            {
+              "name": "profitTarget",
+              "value": "={{ $env.NOF1_PROFIT_TARGET ? Number($env.NOF1_PROFIT_TARGET) : null }}"
+            }
+          ],
+          "boolean": [
+            {
+              "name": "autoRefollow",
+              "value": "={{ $env.NOF1_AUTO_REFOLLOW === 'true' }}"
+            },
+            {
+              "name": "riskOnly",
+              "value": "={{ $env.NOF1_RISK_ONLY === 'true' }}"
+            },
+            {
+              "name": "telegramEnabled",
+              "value": "={{ $env.TELEGRAM_ENABLED === 'true' }}"
+            }
+          ]
+        }
+      },
+      "id": "LoadConfig",
+      "name": "Load Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3,
+      "position": [
+        440,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "const config = $json;\nif (!config.agentId) {\n  throw new Error('Missing NOF1_AGENT_ID environment variable');\n}\nconst initialMarker = new Date('2025-10-17T22:30:00.000Z');\nconst hourInMs = 60 * 60 * 1000;\nconst marker = Math.floor((Date.now() - initialMarker.getTime()) / hourInMs);\nconst staticData = this.getWorkflowStaticData('global');\nif (!staticData.orderHistory) {\n  staticData.orderHistory = {};\n}\nif (!staticData.manualClosures) {\n  staticData.manualClosures = [];\n}\nreturn [{\n  json: {\n    context: {\n      marker,\n      config\n    },\n    history: JSON.parse(JSON.stringify(staticData.orderHistory)),\n    manualClosures: JSON.parse(JSON.stringify(staticData.manualClosures))\n  }\n}];"
+      },
+      "id": "PrepareContext",
+      "name": "Prepare Context",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 2,
+      "position": [
+        680,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $json.context.config.baseUrl }}/account-totals",
+        "responseFormat": "json",
+        "dataPropertyName": "nof1",
+        "queryParameters": [
+          {
+            "name": "lastHourlyMarker",
+            "value": "={{ $json.context.marker }}"
+          }
+        ],
+        "options": {
+          "timeout": 30000,
+          "fullResponse": false
+        }
+      },
+      "id": "FetchAccountTotals",
+      "name": "Fetch Account Totals",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        920,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "const { context, history, manualClosures } = $json;\nconst response = $json.nof1;\nif (!response || !Array.isArray(response.accountTotals)) {\n  return [];\n}\nconst agentId = context.config.agentId;\nconst agent = response.accountTotals.find(acc => acc.model_id === agentId || acc.id === agentId || acc.slug === agentId);\nif (!agent) {\n  return [];\n}\nconst positions = Object.values(agent.positions || {});\nreturn [{\n  json: {\n    context,\n    history,\n    manualClosures,\n    agent,\n    positions\n  }\n}];"
+      },
+      "id": "ExtractAgent",
+      "name": "Extract Agent Positions",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 2,
+      "position": [
+        1160,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "const credentials = await this.getCredentials('binanceApi');\nif (!credentials || !credentials.apiKey || !credentials.apiSecret) {\n  throw new Error('Configure binanceApi credentials for futures trading');\n}\nconst crypto = require('crypto');\nconst baseUrl = credentials.environment === 'testnet' ? 'https://testnet.binancefuture.com' : 'https://fapi.binance.com';\nconst signRequest = async (method, path, payload = {}) => {\n  const params = new URLSearchParams();\n  for (const [key, value] of Object.entries(payload)) {\n    if (value !== undefined && value !== null) {\n      params.append(key, String(value));\n    }\n  }\n  params.append('timestamp', Date.now().toString());\n  params.append('recvWindow', '5000');\n  const query = params.toString();\n  const signature = crypto.createHmac('sha256', credentials.apiSecret).update(query).digest('hex');\n  const uri = `${baseUrl}${path}?${query}&signature=${signature}`;\n  const options = {\n    method,\n    uri,\n    headers: {\n      'X-MBX-APIKEY': credentials.apiKey\n    },\n    json: true\n  };\n  try {\n    return await this.helpers.request(options);\n  } catch (error) {\n    if (error?.response?.body) {\n      throw new Error(`Binance ${path} failed: ${JSON.stringify(error.response.body)}`);\n    }\n    throw error;\n  }\n};\nconst publicRequest = async (path) => {\n  const options = {\n    method: 'GET',\n    uri: `${baseUrl}${path}`,\n    json: true\n  };\n  return await this.helpers.request(options);\n};\nconst account = await signRequest('GET', '/fapi/v2/account');\nconst positions = await signRequest('GET', '/fapi/v2/positionRisk');\nconst tickers = await publicRequest('/fapi/v1/ticker/price');\nreturn [{\n  json: {\n    context: $json.context,\n    history: $json.history,\n    manualClosures: $json.manualClosures,\n    agent: $json.agent,\n    positions: $json.positions,\n    binance: {\n      account,\n      positions,\n      tickers,\n      environment: credentials.environment === 'testnet' ? 'testnet' : 'production'\n    }\n  }\n}];"
+      },
+      "id": "FetchBinanceSnapshot",
+      "name": "Fetch Binance Snapshot",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 2,
+      "position": [
+        1400,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "const data = $json;\nconst config = data.context.config;\nconst agent = data.agent;\nconst positions = data.positions || [];\nconst history = data.history || {};\nconst binance = data.binance;\nconst convertSymbol = (symbol) => symbol.endsWith('USDT') ? symbol : `${symbol}USDT`;\nconst priceMap = new Map((binance.tickers || []).map(t => [t.symbol, parseFloat(t.price)]));\nconst agentId = agent.model_id || agent.id || agent.slug;\nconst agentHistory = history[agentId] || { openPositions: {}, processedOrders: [] };\nif (!agentHistory.openPositions) {\n  agentHistory.openPositions = {};\n}\nconst openPositions = agentHistory.openPositions;\nconst plans = [];\nconst seenSymbols = new Set();\nconst now = Date.now();\nconst validPositions = positions.filter(p => (p.margin || 0) > 0);\nconst allocationMap = new Map();\nif (config.fixedAmountPerCoin && config.fixedAmountPerCoin > 0) {\n  let spent = 0;\n  for (const pos of validPositions) {\n    if (config.totalMargin && spent + config.fixedAmountPerCoin > config.totalMargin) {\n      break;\n    }\n    const symbol = pos.symbol;\n    const binanceSymbol = convertSymbol(symbol);\n    const price = priceMap.get(binanceSymbol) || pos.current_price || pos.entry_price;\n    const leverage = pos.leverage || 1;\n    const allocatedMargin = config.fixedAmountPerCoin;\n    const notionalValue = allocatedMargin * leverage;\n    const adjustedQuantity = price > 0 ? notionalValue / price : Math.abs(pos.quantity);\n    allocationMap.set(symbol, { allocatedMargin, notionalValue, adjustedQuantity, leverage, side: pos.quantity >= 0 ? 'BUY' : 'SELL' });\n    spent += allocatedMargin;\n  }\n} else {\n  const totalMargin = config.totalMargin && config.totalMargin > 0 ? config.totalMargin : 10;\n  const totalOriginal = validPositions.reduce((sum, pos) => sum + (pos.margin || 0), 0) || 0;\n  if (totalOriginal > 0) {\n    for (const pos of validPositions) {\n      const symbol = pos.symbol;\n      const binanceSymbol = convertSymbol(symbol);\n      const ratio = (pos.margin || 0) / totalOriginal;\n      const allocatedMargin = totalMargin * ratio;\n      const leverage = pos.leverage || 1;\n      const price = priceMap.get(binanceSymbol) || pos.current_price || pos.entry_price;\n      const notionalValue = allocatedMargin * leverage;\n      const adjustedQuantity = price > 0 ? notionalValue / price : Math.abs(pos.quantity);\n      allocationMap.set(symbol, { allocatedMargin, notionalValue, adjustedQuantity, leverage, side: pos.quantity >= 0 ? 'BUY' : 'SELL' });\n    }\n  }\n}\nconst findBinancePosition = (symbol) => {\n  const binanceSymbol = convertSymbol(symbol);\n  return (binance.positions || []).find(p => p.symbol === binanceSymbol);\n};\nfor (const pos of positions) {\n  const symbol = pos.symbol;\n  seenSymbols.add(symbol);\n  const entryOid = pos.entry_oid;\n  const side = pos.quantity >= 0 ? 'BUY' : 'SELL';\n  const absQuantity = Math.abs(pos.quantity);\n  const binanceSymbol = convertSymbol(symbol);\n  const price = priceMap.get(binanceSymbol) || pos.current_price || pos.entry_price;\n  const allocation = allocationMap.get(symbol);\n  const previous = openPositions[symbol];\n  const basePlan = {\n    agent: agentId,\n    symbol,\n    side,\n    leverage: pos.leverage || (allocation ? allocation.leverage : 1),\n    marginType: config.marginType || 'CROSSED',\n    entryPrice: pos.entry_price,\n    currentPrice: price,\n    quantity: Number(((allocation ? allocation.adjustedQuantity : absQuantity)).toFixed(6)),\n    allocatedMargin: allocation ? allocation.allocatedMargin : undefined,\n    notionalValue: allocation ? allocation.notionalValue : undefined,\n    position: pos,\n    entryOid,\n    binanceSymbol,\n    timestamp: now\n  };\n  if (config.profitTarget && absQuantity > 0) {\n    const binancePos = findBinancePosition(symbol);\n    if (binancePos) {\n      const entryPrice = parseFloat(binancePos.entryPrice || '0');\n      const positionAmt = parseFloat(binancePos.positionAmt || '0');\n      const leverage = parseFloat(binancePos.leverage || String(pos.leverage || 1));\n      const unrealized = parseFloat(binancePos.unRealizedProfit || '0');\n      const marginBase = binancePos.marginType === 'ISOLATED'\n        ? parseFloat(binancePos.isolatedMargin || '0')\n        : Math.abs(positionAmt * entryPrice) / (leverage || 1);\n      const profitPercentage = marginBase > 0 ? (unrealized / marginBase) * 100 : 0;\n      basePlan.profitPercentage = profitPercentage;\n      if (profitPercentage >= config.profitTarget) {\n        plans.push({\n          ...basePlan,\n          action: 'EXIT',\n          quantity: Math.abs(positionAmt) || basePlan.quantity,\n          reason: `Profit target ${config.profitTarget}% reached (${profitPercentage.toFixed(2)}%)`,\n          trigger: 'PROFIT_TARGET'\n        });\n        continue;\n      }\n    }\n  }\n  if (!previous) {\n    if (absQuantity !== 0) {\n      plans.push({\n        ...basePlan,\n        action: 'ENTER',\n        reason: 'New position signalled by agent',\n        trigger: 'NEW_POSITION'\n      });\n    }\n    continue;\n  }\n  if (previous && previous.entryOid !== entryOid && absQuantity !== 0) {\n    plans.push({\n      ...basePlan,\n      action: 'ENTER',\n      reason: `Entry OID changed ${previous.entryOid} \u2192 ${entryOid}`,\n      trigger: 'ENTRY_CHANGED'\n    });\n    continue;\n  }\n  if (absQuantity === 0 && previous) {\n    plans.push({\n      ...basePlan,\n      action: 'EXIT',\n      quantity: Math.abs(previous.quantity || basePlan.quantity),\n      reason: 'Agent closed position',\n      trigger: 'POSITION_CLOSED'\n    });\n    continue;\n  }\n  if (config.autoRefollow && previous) {\n    const binancePos = findBinancePosition(symbol);\n    const binanceAmt = binancePos ? parseFloat(binancePos.positionAmt || '0') : 0;\n    if (Math.abs(binanceAmt) === 0 && absQuantity !== 0) {\n      plans.push({\n        ...basePlan,\n        action: 'HOLD',\n        quantity: 0,\n        reason: 'Manual closure detected on Binance, resetting history',\n        trigger: 'MANUAL_CLOSED'\n      });\n      continue;\n    }\n  }\n}\nfor (const [symbol, previous] of Object.entries(openPositions)) {\n  if (!seenSymbols.has(symbol) && previous) {\n    plans.push({\n      agent: agentId,\n      symbol,\n      side: previous.side === 'BUY' ? 'SELL' : 'BUY',\n      leverage: previous.leverage || 1,\n      marginType: config.marginType || 'CROSSED',\n      action: 'EXIT',\n      quantity: Math.abs(previous.quantity || previous.adjustedQuantity || 0),\n      reason: 'Agent removed position from feed',\n      trigger: 'POSITION_REMOVED',\n      entryOid: previous.entryOid,\n      timestamp: now\n    });\n  }\n}\nreturn [{\n  json: {\n    context: data.context,\n    agent,\n    binance,\n    history,\n    plans,\n    generatedAt: now\n  }\n}];"
+      },
+      "id": "GeneratePlans",
+      "name": "Generate Follow Plans",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 2,
+      "position": [
+        1640,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "const plans = $json.plans || [];\nif (!plans.length) {\n  return [];\n}\nreturn plans.map(plan => ({\n  json: {\n    context: $json.context,\n    agent: $json.agent,\n    binance: $json.binance,\n    history: $json.history,\n    plan,\n    generatedAt: $json.generatedAt\n  }\n}));"
+      },
+      "id": "ExpandPlans",
+      "name": "Expand Plans",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 2,
+      "position": [
+        1880,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "batchSize": 1
+      },
+      "id": "SplitPlans",
+      "name": "Process Plans in Batches",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 1,
+      "position": [
+        2120,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "const plan = $json.plan;\nconst config = $json.context.config;\nconst tolerance = Number(config.priceTolerance || 1);\nconst entryPrice = plan.entryPrice || (plan.position ? plan.position.entry_price : plan.currentPrice || 0);\nconst currentPrice = plan.currentPrice || (plan.position ? plan.position.current_price : entryPrice);\nconst directionalDifference = entryPrice > 0 ? ((currentPrice - entryPrice) / entryPrice) * 100 : 0;\nconst priceDifference = Math.abs(directionalDifference);\nlet favorable = false;\nif (plan.side === 'BUY') {\n  favorable = directionalDifference <= 0;\n} else if (plan.side === 'SELL') {\n  favorable = directionalDifference >= 0;\n}\nconst withinTolerance = priceDifference <= tolerance;\nconst riskScore = Math.min(20 + (plan.leverage || 1) * 10, 100);\nconst warnings = [];\nif (plan.leverage > 20) {\n  warnings.push('High leverage detected');\n}\nif (riskScore > 80) {\n  warnings.push('High risk score');\n}\nif (!withinTolerance) {\n  warnings.push(`Price difference ${priceDifference.toFixed(2)}% exceeds tolerance ${tolerance}%`);\n}\nconst priceTolerance = {\n  entryPrice,\n  currentPrice,\n  priceDifference,\n  directionalPriceDifference: directionalDifference,\n  tolerance,\n  withinTolerance,\n  shouldExecute: withinTolerance || favorable,\n  favorableForExecution: favorable,\n  side: plan.side,\n  reason: withinTolerance\n    ? `Price difference ${priceDifference.toFixed(2)}% is within tolerance ${tolerance}%`\n    : favorable\n      ? `Price moved favorably (${directionalDifference.toFixed(2)}%) for ${plan.side}`\n      : `Price difference ${priceDifference.toFixed(2)}% exceeds tolerance ${tolerance}%`\n};\nconst shouldExecute = (plan.action === 'ENTER' || plan.action === 'EXIT') && priceTolerance.shouldExecute;\nreturn [{\n  json: {\n    ...$json,\n    riskAssessment: {\n      isValid: shouldExecute,\n      riskScore,\n      warnings,\n      maxLoss: (plan.notionalValue || 0) - (plan.allocatedMargin || 0),\n      suggestedPositionSize: plan.quantity,\n      priceTolerance\n    },\n    shouldExecute,\n    skipped: !shouldExecute\n  }\n}];"
+      },
+      "id": "AssessRisk",
+      "name": "Assess Risk",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 2,
+      "position": [
+        2360,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "expression",
+        "conditions": {
+          "expression": [
+            {
+              "value": "={{ $json.shouldExecute && !$json.context.config.riskOnly }}"
+            }
+          ]
+        }
+      },
+      "id": "ExecuteDecision",
+      "name": "Execute Trade?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2600,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "const plan = $json.plan;\nconst config = $json.context.config;\nconst credentials = await this.getCredentials('binanceApi');\nconst crypto = require('crypto');\nconst baseUrl = credentials.environment === 'testnet' ? 'https://testnet.binancefuture.com' : 'https://fapi.binance.com';\nconst signRequest = async (method, path, payload = {}) => {\n  const params = new URLSearchParams();\n  for (const [key, value] of Object.entries(payload)) {\n    if (value !== undefined && value !== null) {\n      params.append(key, String(value));\n    }\n  }\n  params.append('timestamp', Date.now().toString());\n  params.append('recvWindow', '5000');\n  const query = params.toString();\n  const signature = crypto.createHmac('sha256', credentials.apiSecret).update(query).digest('hex');\n  const uri = `${baseUrl}${path}?${query}&signature=${signature}`;\n  const options = {\n    method,\n    uri,\n    headers: {\n      'X-MBX-APIKEY': credentials.apiKey\n    },\n    json: true\n  };\n  try {\n    return await this.helpers.request(options);\n  } catch (error) {\n    if (error?.response?.body) {\n      throw new Error(`Binance ${path} failed: ${JSON.stringify(error.response.body)}`);\n    }\n    throw error;\n  }\n};\nconst safeCall = async (method, path, payload, ignoreCodes = []) => {\n  try {\n    return await signRequest(method, path, payload);\n  } catch (error) {\n    const message = error.message || '';\n    if (ignoreCodes.some(code => message.includes(code))) {\n      return null;\n    }\n    throw error;\n  }\n};\nconst binanceSymbol = plan.binanceSymbol || plan.symbol;\nconst marginType = plan.marginType || config.marginType || 'CROSSED';\nawait safeCall('POST', '/fapi/v1/marginType', { symbol: binanceSymbol, marginType }, ['-4046', '-4061', '-4059']);\nawait safeCall('POST', '/fapi/v1/leverage', { symbol: binanceSymbol, leverage: plan.leverage || 1 }, []);\nconst quantity = Math.max(Number(plan.quantity || 0), 0);\nif (!quantity) {\n  return [{ json: { ...$json, execution: { success: false, error: 'Quantity is zero' } } }];\n}\nconst orderPayload = {\n  symbol: binanceSymbol,\n  side: plan.side,\n  type: 'MARKET',\n  quantity: quantity.toFixed(6)\n};\nif (plan.action === 'EXIT') {\n  orderPayload.reduceOnly = 'true';\n}\nconst order = await signRequest('POST', '/fapi/v1/order', orderPayload);\nif (config.telegramEnabled && config.telegramToken && config.telegramChatId) {\n  const text = `\ud83e\udd16 ${plan.agent} ${plan.action} ${plan.symbol} ${plan.side} x${plan.leverage} qty ${quantity.toFixed(4)} at ${plan.currentPrice}`;\n  await this.helpers.request({\n    method: 'POST',\n    uri: `https://api.telegram.org/bot${config.telegramToken}/sendMessage`,\n    body: {\n      chat_id: config.telegramChatId,\n      text,\n      parse_mode: 'Markdown'\n    },\n    json: true\n  });\n}\nreturn [{\n  json: {\n    ...$json,\n    execution: {\n      success: true,\n      order,\n      marginType,\n      leverage: plan.leverage || 1,\n      quantity\n    }\n  }\n}];"
+      },
+      "id": "ExecuteTrade",
+      "name": "Execute Binance Trade",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 2,
+      "position": [
+        2840,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "const staticData = this.getWorkflowStaticData('global');\nif (!staticData.orderHistory) {\n  staticData.orderHistory = {};\n}\nconst agentId = $json.agent.model_id || $json.agent.id || $json.agent.slug;\nconst plan = $json.plan;\nconst execution = $json.execution || { success: false };\nconst history = staticData.orderHistory[agentId] || { openPositions: {}, processedOrders: [] };\nif (!history.openPositions) {\n  history.openPositions = {};\n}\nif (!history.processedOrders) {\n  history.processedOrders = [];\n}\nif (execution.success) {\n  if (plan.action === 'ENTER') {\n    history.openPositions[plan.symbol] = {\n      entryOid: plan.entryOid,\n      side: plan.side,\n      quantity: plan.quantity,\n      leverage: plan.leverage,\n      entryPrice: plan.entryPrice,\n      marginType: plan.marginType || $json.context.config.marginType || 'CROSSED',\n      timestamp: Date.now()\n    };\n  }\n  if (plan.action === 'EXIT' || plan.action === 'HOLD') {\n    delete history.openPositions[plan.symbol];\n  }\n  history.processedOrders.push({\n    entryOid: plan.entryOid,\n    symbol: plan.symbol,\n    side: plan.side,\n    quantity: plan.quantity,\n    agent: agentId,\n    timestamp: Date.now(),\n    reason: plan.reason,\n    trigger: plan.trigger,\n    orderId: execution.order?.orderId || execution.order?.clientOrderId\n  });\n}\nstaticData.orderHistory[agentId] = history;\nreturn [{ json: $json }];"
+      },
+      "id": "UpdateHistory",
+      "name": "Update History",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 2,
+      "position": [
+        3080,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "const staticData = this.getWorkflowStaticData('global');\nif (!staticData.orderHistory) {\n  staticData.orderHistory = {};\n}\nconst agentId = $json.agent.model_id || $json.agent.id || $json.agent.slug;\nconst plan = $json.plan;\nconst history = staticData.orderHistory[agentId] || { openPositions: {}, processedOrders: [] };\nif (!history.openPositions) {\n  history.openPositions = {};\n}\nif (plan.trigger === 'MANUAL_CLOSED') {\n  delete history.openPositions[plan.symbol];\n}\nstaticData.orderHistory[agentId] = history;\nreturn [{\n  json: {\n    ...$json,\n    execution: {\n      success: false,\n      reason: 'Skipped'\n    }\n  }\n}];"
+      },
+      "id": "RecordSkip",
+      "name": "Record Skip/Manual Reset",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 2,
+      "position": [
+        2840,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "return [{\n  json: {\n    plan: $json.plan,\n    execution: $json.execution,\n    riskAssessment: $json.riskAssessment\n  }\n}];"
+      },
+      "id": "FinalizePlan",
+      "name": "Finalize Plan Result",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 2,
+      "position": [
+        3320,
+        300
+      ]
+    }
+  ],
+  "connections": {
+    "Agent Poll Schedule": {
+      "main": [
+        [
+          {
+            "node": "Load Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Config": {
+      "main": [
+        [
+          {
+            "node": "Prepare Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Context": {
+      "main": [
+        [
+          {
+            "node": "Fetch Account Totals",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Account Totals": {
+      "main": [
+        [
+          {
+            "node": "Extract Agent Positions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Agent Positions": {
+      "main": [
+        [
+          {
+            "node": "Fetch Binance Snapshot",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Binance Snapshot": {
+      "main": [
+        [
+          {
+            "node": "Generate Follow Plans",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate Follow Plans": {
+      "main": [
+        [
+          {
+            "node": "Expand Plans",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Expand Plans": {
+      "main": [
+        [
+          {
+            "node": "Process Plans in Batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Process Plans in Batches": {
+      "main": [
+        [
+          {
+            "node": "Assess Risk",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Process Plans in Batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Assess Risk": {
+      "main": [
+        [
+          {
+            "node": "Execute Trade?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute Trade?": {
+      "main": [
+        [
+          {
+            "node": "Execute Binance Trade",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Record Skip/Manual Reset",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute Binance Trade": {
+      "main": [
+        [
+          {
+            "node": "Update History",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update History": {
+      "main": [
+        [
+          {
+            "node": "Process Plans in Batches",
+            "type": "main",
+            "index": 1
+          }
+        ],
+        [
+          {
+            "node": "Finalize Plan Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record Skip/Manual Reset": {
+      "main": [
+        [
+          {
+            "node": "Process Plans in Batches",
+            "type": "main",
+            "index": 1
+          }
+        ],
+        [
+          {
+            "node": "Finalize Plan Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Finalize Plan Result": {
+      "main": []
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "versionId": "d41d6510-34df-4c56-b6ed-c7e61aee7640"
+}
